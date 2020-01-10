@@ -1,0 +1,279 @@
+---
+title: "Data Science: Churn Analysis"
+subtitle: 
+  - "Detect customer churn based on use of dating platfom"
+author: 
+  - "Marilson Campos" 
+  - 'Version: 1.01 - `r format(Sys.Date(), "%B, %Y")`'
+classoption: oneside
+output:
+  pdf_document: 
+    toc: true
+    toc_depth: 3
+    number_sections: true
+mainfont: Arial
+geometry: "left=2.5cm, right=2.5cm, top=3.5cm, bottom=1.5cm"
+---
+
+\pagebreak
+# Introduction
+
+The objective of this project try to predict cancelations of an online dating site based on the behaviour of the customers on the platform. The variables used in the models represent real types of events and occur between two users.
+
+For each event there are variables marked with the prefix 'i_' meaning the current user received an event or with 'o_' prefix fix the user initiated (outgoing). For example a user can 'send a chat request' to another user. This action will create two records one for the user that sent the event with a prefix 'o_' and onother one to the user receiving the request with the prefix 'i_'.
+
+There is also a measurement of engagement between users. This is marked with strings of type d<x>d<y>, where <x> and <y> are numbers.
+
+For example, chat request marked as 'd2d1' means that the user that send that request is interacting for the second time and the the other user already gave him/her a response. As these numbers are higher on events it means that users are engaging in conversations. 
+
+Our goal is to try to learn these signals and identify users that are likely to cancel the service.
+
+We will be using a variable called cancel_07 that marks users that canceled withing seven days of subscription.
+
+
+We are following the sequence of steps as described below: 
+
+1. Project setup and dataset load
+2. Definition of few helper funcions
+3. Exploratory Data Analysis
+4. Indentification of highly correlated variables.
+5. Build Initial logistic regression
+6. Validate the significance of varialbes
+7. Build a model using the significant variables
+8. Present results
+
+\pagebreak
+# Environment Setup
+
+## Loading the R packages used in project.
+
+``` {r load our packages, echo = TRUE, message= FALSE, warning = FALSE}
+repo_url <- "http://cran.us.r-project.org"
+if(!require(kableExtra)) 
+  install.packages("kableExtra", repos = repo_url)
+if(!require(tidyverse))
+  install.packages("tidyverse", repos = repo_url)
+if(!require(data.table)) 
+  install.packages("data.table", repos = repo_url)
+if(!require(caret)) 
+  install.packages("caret", repos = repo_url)
+```
+
+# Helper functions.
+```{r some helper functions}
+cor_prob <- function (X, dfr = nrow(X) - 2) {
+  R <- cor(X, use="pairwise.complete.obs")
+  above <- row(R) < col(R)
+  r2 <- R[above]^2
+  Fstat <- r2 * dfr/(1 - r2)
+  R[above] <- 1 - pf(Fstat, 1, dfr)
+  R[row(R) == col(R)] <- NA
+  R
+}
+
+flatten_square_matrix <- function(m) {
+  if( (class(m) != "matrix") | (nrow(m) != ncol(m))) stop("Must be a square matrix.") 
+  if(!identical(rownames(m), colnames(m))) stop("Row and column names must be equal.")
+  ut <- upper.tri(m)
+  data.frame(i = rownames(m)[row(m)[ut]], j = rownames(m)[col(m)[ut]],
+             cor=t(m)[ut], p=m[ut])
+}
+
+order_by_pvalue <- function(fit.data, selected) {
+  d1 <- data.frame(summary(fit.data)$coeff)
+  dta <- cbind(variable=rownames(d1), d1)
+  dta <-dta[selected, ]
+  names(dta) <- c('Variable', 'Estimate', 'Std.Error', 'z.value', 'pvalue')
+  selected.ds <- dta %>% 
+    filter(Variable != '(Intercept)') %>% 
+    arrange(pvalue)
+  names(selected.ds)[5] <- 'p-value'
+  return(selected.ds)
+}
+
+separate.variables <- function(fit.data, alpha.level) {
+  signif.idx <- summary(fit.data)$coeff[,4] < alpha.level
+  signif.idx[0] <- TRUE
+  result <- list(significant = order_by_pvalue(fit.data, signif.idx),
+                 nonsignificant = order_by_pvalue(fit.data, !signif.idx))
+  return(result)
+}
+```
+
+
+# Preparing the datasets.
+
+Here we are loading the train dataset. Since the dataset is from a real system, we are ignoring irrelevant columns and using the 
+field relevant to the churn analysis considering cancelation within 7 days.
+
+``` {r}
+load_clean_data <- function (ds_filename) {
+  temp <- read.table(ds_filename, sep=",", header=TRUE)
+  temp['i_pmf_7d_after_sub'] <- temp['i_pmfcan_7d_after_sub'] + temp['i_pmfcus_7d_after_sub']
+  temp_tb <- as_tibble(temp) %>%
+    filter(duration == 1 & gender == 1 & iswinback==0) %>%
+    select(
+      cancel_07,
+      i_fr_7d_after_sub, i_ch_7d_after_sub, i_fl_7d_after_sub,
+      i_pv_7d_after_sub, i_wr_7d_after_sub, i_fl_from_blocked_7d_after_sub,
+      i_wi_from_blocked_7d_after_sub,
+      o_wi_7d_after_sub, o_fr_7d_after_sub, o_ch_7d_after_sub, o_fl_7d_after_sub,
+      o_pv_7d_after_sub,
+      o_ciy_7d_after_sub, o_caru_7d_after_sub, o_za_zm_7d_after_sub, 
+      o_zd_7d_after_sub,  o_fl_blocked_7d_after_sub,
+      o_wi_blocked_7d_after_sub, photo_ver_7d_after_sub,
+      d2d2_blocked_7d_after_sub,
+      i_fl_pm_7d_after_sub, i_gmf_7d_after_sub, i_pmf_7d_after_sub,
+      o_gmf_7d_after_sub, o_pmfcan_7d_after_sub, o_pmfcus_7d_after_sub,
+      o_cin_7d_after_sub,
+      invi_7d_after_sub)
+  # model1_ds <- na.omit(model1_ds)
+  temp_tb
+}
+
+# Loading the data ---------------------------
+work_dir <- '/tmp/churn'
+train_filename <- paste(work_dir, '/', 'train_data.csv', sep = '')
+test_filename <- paste(work_dir,  '/', 'test_data.csv', sep = '')
+train_tb <- load_clean_data(train_filename) 
+test_tb <- load_clean_data(test_filename) 
+```
+
+\pagebreak
+
+# Basic Exploratory Data Analysis (EDA)
+
+Lets take a look into our train dataset.
+
+```{r}
+str(train_tb)
+```
+
+As we can see our dataset has lots of variables repreenting the count of events between two users. The prefix 'o_' means that the user initiated the action while the prefix 'i_' means that the user received an event.
+
+Also, we can see pairs of d<x>d<y> strings in the variable names. These represents that how deep the connection between two users. 
+For example a d2d1 means that the user initiated 2 events and received 1 event from the other user.
+
+\pagebreak
+
+## Looking at highly correlated variables
+
+
+### Selecting the variables with large correlation coefficients.
+
+Lets look at pairs of variables that have a correlation coefficients higher than 0.80.
+
+```{r, warning=FALSE}
+cor_results <- flatten_square_matrix(cor_prob(train_tb))
+cor_table <- cor_results %>% 
+  select(i,j,cor)  %>% 
+  filter(abs(cor) > 0.80) %>% 
+  arrange(i,desc(cor))
+names(cor_table) <- c('Variable 1', 'Variable 2', 'Correlation Coef.')
+kable(cor_table) %>% 
+  kable_styling(position = "center", full_width = F)
+```
+
+
+As we can see there are many variables pairs that are highly correlated.
+
+Based on the list above we are selecting one of the variables of each pair to keep and will drop the other variable.
+
+
+# Dropping variables 
+
+Since the correlation coeficient of the 'o_ch_7d_after_sub' variable, we've are dropping from the model:
+```{r}
+train_tb_v1 <- train_tb %>% select (-c(o_ch_7d_after_sub))
+```
+
+
+\pagebreak
+# Build a Logistic Regression Model
+```{r warning=FALSE}
+logit_model_v1 <- glm(formula = cancel_07 ~ ., family = binomial, data = train_tb_v1)
+summary(logit_model_v1)
+```
+
+\pagebreak
+
+## Model review
+### Significant variables at 0.05 level.
+
+```{r}
+model_v1_vars <- separate.variables(logit_model_v1, 0.05)
+kable(model_v1_vars$significant) %>% 
+  kable_styling(position = "center", full_width = F)
+```
+
+## Nonsignificant variables at 0.05 level
+
+```{r}
+kable(model_v1_vars$nonsignificant) %>% 
+  kable_styling(position = "center", full_width = F)
+```
+
+As we can see there are many variables that are clearly not significant at p=0.05.
+
+So our next step is to build a model using only the significant variables next.
+
+\pagebreak
+# Model including only the significant variables
+
+## preparing a a dataset containing only the data we need.
+
+```{r}
+extract_ds_v2 <- function(ds) {
+  ds %>% 
+    select(cancel_07,
+           o_pv_7d_after_sub, i_pv_7d_after_sub, o_za_zm_7d_after_sub,
+           o_fl_7d_after_sub, i_gmf_7d_after_sub, o_ciy_7d_after_sub,
+           i_ch_7d_after_sub, photo_ver_7d_after_sub, i_fl_pm_7d_after_sub,
+           i_wi_from_blocked_7d_after_sub, o_zd_7d_after_sub, o_wi_7d_after_sub)
+}
+model_v1_vars$significant$Variable
+train_tb_v2 <- extract_ds_v2(train_tb_v1)
+test_tb_v2 <- extract_ds_v2(test_tb)
+```
+
+## Build the model using the new data.
+
+```{r warning=FALSE}
+logit_model_v2 <- glm(formula = cancel_07 ~ ., family = binomial, data = train_tb_v2)
+summary(logit_model_v2)
+```
+
+As we can see now this model is simpler and easier to understand and optimize.
+
+# Predicting churn
+```{r}
+test_input <- test_tb_v2
+test_input$pred_prob <- predict(logit_model_v2, test_tb_v2, type = "response")
+```
+
+```{r}
+test_input <- test_input  %>% 
+  mutate(model_pred = 1 * (pred_prob > 0.53) + 0)
+test_input$model_pred[is.na(test_input$model_pred)] <- 0
+test_input <- test_input %>% mutate(accurate = 1 * (model_pred == cancel_07) + 0)
+model_accuracy_pct <- sum(test_input$accurate)/nrow(test_input) * 100
+
+accuracy_df <- data.frame(model = "Simple Model (Avg Rating)", rmse = round(model_accuracy_pct,digits=3))
+names(accuracy_df)  <- c("Metric", "Value")
+kable(accuracy_df) %>% 
+    kable_styling(position = "center", full_width = F)
+```
+
+As we can see our model in predicting churn correctly about 75% of time. This is good enough to use this model to select the 
+users more likely to churm and give them some addition support and/or offer them some kind of dicount.
+
+
+# Possible improvements
+
+a. We could look at some of the variables that dont have a linear relationship with the probability of churn and transform them 
+using a function like log(x)+1.
+
+b. We could also expand the model include combination of events.
+
+
+
